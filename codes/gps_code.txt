@@ -1,0 +1,182 @@
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <TinyGPS++.h>
+#include <time.h>
+
+/* 🔹 WiFi */
+#define WIFI_SSID "Rk"
+#define WIFI_PASSWORD "ram123456789"
+
+/* 🔹 Firebase */
+#define API_KEY "AIzaSyBjU-GR84WpBYWV4iFga19H5BvkK70lyZk"
+#define DATABASE_URL "https://car-blackbox-1-default-rtdb.asia-southeast1.firebasedatabase.app"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+/* 🔹 GPS */
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2);
+
+/* 🔹 Variables */
+float latitude = 0;
+float longitude = 0;
+float speed = 0;
+
+unsigned long lastUpload = 0;
+unsigned long lastTrip = 0;
+
+String lastEvent = "";
+unsigned long stopTime = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  /* GPS */
+  gpsSerial.begin(9600, SERIAL_8N1, 16, 17);
+  Serial.println("GPS Started");
+
+  /* WiFi */
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected ✔");
+
+  /* TIME (IST) */
+  configTime(19800, 0, "pool.ntp.org");
+
+  while (time(nullptr) < 100000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nTime Ready ✔");
+
+  /* Firebase */
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  Firebase.signUp(&config, &auth, "", "");
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+void loop() {
+
+  /* 🔥 READ GPS */
+  while (gpsSerial.available()) {
+    gps.encode(gpsSerial.read());
+  }
+
+  if (gps.location.isValid()) {
+    latitude = gps.location.lat();
+    longitude = gps.location.lng();
+  }
+
+  if (gps.speed.isValid()) {
+    speed = gps.speed.kmph();
+    if (speed < 1) speed = 0;
+  }
+
+  /* 🔥 EVENT LOGIC */
+  String event = "NORMAL";
+  int risk = 0;
+
+  if (speed > 70) {
+    event = "CRASH";
+    risk = 10;
+  }
+  else if (speed > 40) {
+    event = "TILT";
+    risk = 5;
+  }
+
+  /* 🔥 FIREBASE UPDATE */
+  if (millis() - lastUpload > 2000) {
+    lastUpload = millis();
+
+    if (WiFi.status() == WL_CONNECTED) {
+
+      /* GPS */
+      Firebase.RTDB.setFloat(&fbdo, "/Vehicle/GPS/latitude", latitude);
+      Firebase.RTDB.setFloat(&fbdo, "/Vehicle/GPS/longitude", longitude);
+      Firebase.RTDB.setFloat(&fbdo, "/Vehicle/GPS/speed", speed);
+
+      /* LIVE */
+      Firebase.RTDB.setString(&fbdo, "/Vehicle/Live/event", event);
+      Firebase.RTDB.setInt(&fbdo, "/Vehicle/Live/riskscore", risk);
+
+      Serial.println("Live Updated ✔");
+    }
+  }
+
+  /* 🔥 TRIP (EVERY 5 SEC) */
+  if (millis() - lastTrip > 5000) {
+    lastTrip = millis();
+
+    FirebaseJson trip;
+    trip.set("lat", latitude);
+    trip.set("lng", longitude);
+
+    Firebase.RTDB.pushJSON(&fbdo, "/Vehicle/Trip", &trip);
+  }
+
+  /* 🔥 PARKING DETECTION */
+  if (speed == 0) {
+    if (stopTime == 0) stopTime = millis();
+
+    if (millis() - stopTime > 5000) {
+      Firebase.RTDB.setFloat(&fbdo, "/Vehicle/Parking/lat", latitude);
+      Firebase.RTDB.setFloat(&fbdo, "/Vehicle/Parking/lng", longitude);
+    }
+  } else {
+    stopTime = 0;
+  }
+
+  /* 🔥 HISTORY (ONLY ON CHANGE) */
+  if (event != "NORMAL" && event != lastEvent) {
+
+    FirebaseJson json;
+
+    time_t now = time(nullptr);
+    struct tm *t = localtime(&now);
+
+    char timeStr[30];
+    sprintf(timeStr, "%02d-%02d-%04d %02d:%02d:%02d",
+            t->tm_mday,
+            t->tm_mon + 1,
+            t->tm_year + 1900,
+            t->tm_hour,
+            t->tm_min,
+            t->tm_sec);
+
+    json.set("event", event);
+    json.set("risk", risk);
+    json.set("time", timeStr);
+
+    Firebase.RTDB.pushJSON(&fbdo, "/Vehicle/History", &json);
+
+    lastEvent = event;
+  }
+
+  if (event == "NORMAL") {
+    lastEvent = "";
+  }
+
+  /* SERIAL DEBUG */
+  Serial.print("Lat: ");
+  Serial.print(latitude, 6);
+  Serial.print(" | Lon: ");
+  Serial.print(longitude, 6);
+  Serial.print(" | Speed: ");
+  Serial.print(speed);
+  Serial.print(" | Event: ");
+  Serial.println(event);
+
+  delay(500);
+}

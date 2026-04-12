@@ -1,0 +1,213 @@
+#include <Wire.h>
+#include <MPU6050.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <time.h>
+
+MPU6050 mpu;
+
+// WiFi
+#define WIFI_SSID "Rk"
+#define WIFI_PASSWORD "ram123456789"
+
+// Firebase
+#define API_KEY "AIzaSyBjU-GR84WpBYWV4iFga19H5BvkK70lyZk"
+#define DATABASE_URL "https://car-blackbox-1-default-rtdb.asia-southeast1.firebasedatabase.app"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+float prevAcc = 0;
+
+String currentEvent = "NORMAL";
+unsigned long eventStartTime = 0;
+
+const int HOLD_TIME = 1200;
+
+unsigned long lastUpload = 0;
+String lastStoredEvent = "";
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  // 🔹 MPU INIT
+  Wire.begin(21, 22);
+  Wire.setClock(100000);
+  delay(1000);
+
+  mpu.initialize();
+  Serial.println("MPU initialized");
+
+  // 🔹 WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected ✔");
+
+  // 🔹 TIME (IST)
+  configTime(19800, 0, "pool.ntp.org");
+
+  Serial.print("Waiting for time");
+  while (time(nullptr) < 100000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nTime Ready ✔");
+
+  // 🔹 Firebase
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println("Firebase SignUp OK");
+  } else {
+    Serial.println("Firebase SignUp FAILED");
+    Serial.println(config.signer.signupError.message.c_str());
+  }
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+void loop() {
+
+  // 🔹 MPU READ
+  int16_t ax, ay, az;
+  mpu.getAcceleration(&ax, &ay, &az);
+
+  float Ax = ax / 16384.0;
+  float Ay = ay / 16384.0;
+  float Az = az / 16384.0;
+
+  float totalAcc = sqrt(Ax*Ax + Ay*Ay + Az*Az);
+  float motionAcc = abs(totalAcc - 1.0);
+
+  float deltaAcc = abs(totalAcc - prevAcc);
+  prevAcc = totalAcc;
+
+  float angle = 0;
+  if (totalAcc > 0.01)
+    angle = acos(Az / totalAcc) * 180 / PI;
+
+  String detectedEvent = "NORMAL";
+
+  // 🔥 EVENT DETECTION
+  if (Az < -0.65) {
+    detectedEvent = "ROLLOVER";
+  }
+  else if (
+    motionAcc > 0.5 ||
+    deltaAcc > 0.4 ||
+    abs(Ax) > 1.2 ||
+    abs(Ay) > 1.2
+  ) {
+    detectedEvent = "CRASH";
+  }
+  else if (angle > 55) {
+    detectedEvent = "TILT";
+  }
+
+  // 🔹 HOLD LOGIC
+  if (detectedEvent != "NORMAL") {
+    currentEvent = detectedEvent;
+    eventStartTime = millis();
+  }
+
+  if (currentEvent != "NORMAL") {
+    if (millis() - eventStartTime > HOLD_TIME) {
+      currentEvent = "NORMAL";
+    }
+  }
+
+  int risk = 0;
+  if (currentEvent == "ROLLOVER") risk = 15;
+  else if (currentEvent == "CRASH") risk = 10;
+  else if (currentEvent == "TILT") risk = 5;
+
+  // 🔥 FIREBASE UPDATE
+  if (millis() - lastUpload > 2000) {
+    lastUpload = millis();
+
+    if (WiFi.status() == WL_CONNECTED) {
+
+      // 🔹 LIVE DATA
+      Firebase.RTDB.setString(&fbdo, "/Vehicle/Live/event", currentEvent);
+      Firebase.RTDB.setInt(&fbdo, "/Vehicle/Live/riskscore", risk);
+
+      Serial.println("Live Updated ✔");
+
+      // 🔥 STORE HISTORY (NO DUPLICATE)
+      if (currentEvent != "NORMAL" && currentEvent != lastStoredEvent) {
+
+        FirebaseJson json;
+
+        // 🔹 GET REAL TIME (IST)
+        time_t now = time(nullptr);
+        struct tm *timeinfo = localtime(&now);
+
+        char timeStr[30];
+        sprintf(timeStr, "%02d-%02d-%04d %02d:%02d:%02d",
+                timeinfo->tm_mday,
+                timeinfo->tm_mon + 1,
+                timeinfo->tm_year + 1900,
+                timeinfo->tm_hour,
+                timeinfo->tm_min,
+                timeinfo->tm_sec);
+
+        json.set("event", currentEvent);
+        json.set("risk", risk);
+        json.set("time", timeStr);
+
+        if (Firebase.RTDB.pushJSON(&fbdo, "/Vehicle/History", &json)) {
+          Serial.println("History Stored ✔");
+          lastStoredEvent = currentEvent;
+
+          // 🔥 LIMIT HISTORY TO 30 EVENTS
+          if (Firebase.RTDB.getJSON(&fbdo, "/Vehicle/History")) {
+
+            FirebaseJson &jsonData = fbdo.jsonObject();
+            size_t count = jsonData.iteratorBegin();
+
+            if (count > 30) {
+              String key, value;
+              int type;
+
+              jsonData.iteratorGet(0, type, key, value);
+              Firebase.RTDB.deleteNode(&fbdo, "/Vehicle/History/" + key);
+
+              Serial.println("Old history deleted ✔");
+            }
+
+            jsonData.iteratorEnd();
+          }
+
+        } else {
+          Serial.println("History FAILED ❌");
+          Serial.println(fbdo.errorReason());
+        }
+      }
+
+      if (currentEvent == "NORMAL") {
+        lastStoredEvent = "";
+      }
+
+      // 🔹 EMERGENCY FLAG
+      if (currentEvent == "CRASH" || currentEvent == "ROLLOVER") {
+        Firebase.RTDB.setBool(&fbdo, "/Emergency/status", true);
+      }
+    }
+  }
+
+  // 🔹 SERIAL OUTPUT
+  Serial.print("Event: ");
+  Serial.print(currentEvent);
+  Serial.print(" | Risk: ");
+  Serial.println(risk);
+
+  delay(120);
+}
