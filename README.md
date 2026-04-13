@@ -30,6 +30,6 @@ Sensor data from accelerometer and GPS is collected using ESP32 and processed to
 - Detection of abnormal events
 - Live dashboard visualization
 ## Project Demonstration
--Video link:https://drive.google.com/file/d/10Ad_Lc863HuLrrunjVcJyPGY3vc6MrT_/view?usp=sharing
+Video link : https://drive.google.com/file/d/10Ad_Lc863HuLrrunjVcJyPGY3vc6MrT_/view?usp=sharing
 ## Author
 Ram Kumar B
